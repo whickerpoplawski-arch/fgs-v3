@@ -24,32 +24,65 @@ export function defaultFlagRegex(flags = DEFAULT_FLAG_FLAGS) {
   return new RegExp(DEFAULT_FLAG_PATTERN, String(flags).replace(/g/g, ''));
 }
 
-/** 本地假 CTF 校验器：satisfiedBy 引用的 facts 里必须出现 expectedFlag。 */
-export function makeLocalFlagVerify(expectedFlag) {
-  return (graph, op) => {
-    const byId = new Map(graph.facts.map((f) => [f.id, f]));
-    for (const fid of op.satisfiedBy ?? []) {
-      const fact = byId.get(fid);
-      if (!fact) return `satisfiedBy 引用不存在 fact: ${fid}`;
-      const blob = `${fact.title ?? ''}\n${fact.content ?? ''}`;
-      if (!String(blob).includes(expectedFlag)) return `fact ${fid} 未含有效 flag 证据`;
-    }
-    return null;
-  };
+/** `all` = 每条 satisfiedBy 都要含 flag；其它（含缺省）= 任一条即可。 */
+export function satisfyFlagModeOf(mode) {
+  return mode === 'all' ? 'all' : 'any';
 }
 
-/** 正则校验器：satisfiedBy 引用的 facts 里必须含匹配 flagRe 的串。 */
-export function makeRegexFlagVerify(flagRe = defaultFlagRegex()) {
-  return (graph, op) => {
-    const byId = new Map(graph.facts.map((f) => [f.id, f]));
-    for (const fid of op.satisfiedBy ?? []) {
-      const fact = byId.get(fid);
-      if (!fact) return `satisfiedBy 引用不存在 fact: ${fid}`;
-      const blob = `${fact.title ?? ''}\n${fact.content ?? ''}`;
-      if (!flagRe.test(String(blob))) return `fact ${fid} 未匹配 flag 正则`;
+/**
+ * regex / local：默认 any。错误列出已匹配 id 与缺 flag 的 id。
+ * 引用了不存在的 fact 仍整批拒绝（与 mode 无关）。
+ * command 不在这里逐条判：外部命令拿到全部引用 fact；
+ * tools/submit_flag.mjs 从合并文本抽 flag，有一条含 flag 即可尝试提交。
+ */
+function checkSatisfiedFlags(graph, op, hasFlag, lackPhrase, mode) {
+  const byId = new Map((graph.facts ?? []).map((f) => [f.id, f]));
+  const matched = [];
+  const lacked = [];
+  const missing = [];
+  for (const fid of op.satisfiedBy ?? []) {
+    const fact = byId.get(fid);
+    if (!fact) {
+      missing.push(fid);
+      continue;
     }
-    return null;
-  };
+    const blob = `${fact.title ?? ''}\n${fact.content ?? ''}`;
+    if (hasFlag(String(blob))) matched.push(fid);
+    else lacked.push(fid);
+  }
+  if (missing.length) return `satisfiedBy 引用不存在 fact: ${missing.join(', ')}`;
+  const pass = mode === 'all' ? lacked.length === 0 : matched.length > 0;
+  if (pass) return null;
+  const matchedText = matched.length ? matched.join(', ') : '无';
+  const lackedText = lacked.length ? lacked.join(', ') : '无';
+  return `已匹配: ${matchedText}；${lackPhrase}: ${lackedText}`;
+}
+
+/** 本地假 CTF 校验器。默认任一条 fact 含 expectedFlag 即可（satisfyFlagMode=any|all）。 */
+export function makeLocalFlagVerify(expectedFlag, options = {}) {
+  const mode = satisfyFlagModeOf(options.satisfyFlagMode);
+  return (graph, op) => checkSatisfiedFlags(
+    graph,
+    op,
+    (blob) => blob.includes(expectedFlag),
+    '未含有效 flag',
+    mode,
+  );
+}
+
+/** 正则校验器。默认任一条 fact 匹配 flagRe 即可（satisfyFlagMode=any|all）。 */
+export function makeRegexFlagVerify(flagRe = defaultFlagRegex(), options = {}) {
+  const mode = satisfyFlagModeOf(options.satisfyFlagMode);
+  return (graph, op) => checkSatisfiedFlags(
+    graph,
+    op,
+    (blob) => {
+      flagRe.lastIndex = 0;
+      return flagRe.test(blob);
+    },
+    '未匹配 flag 正则',
+    mode,
+  );
 }
 
 /** 永久拒绝校验器：verifyMode=none 时显式记录「未配置外部校验」。 */
@@ -107,19 +140,21 @@ export function makeCommandVerify(command, options = {}) {
 /**
  * 按配置构造校验器。**永不返回 null**：CONTRACT §8 要求 satisfy_goal 提交前
  * 必须过外部校验，硬门不允许被配置关掉。
- * - regex（默认）：satisfiedBy 引用的 fact 文本须匹配 flagPattern
- * - local：须含 expectedFlag
- * - command：外部校验命令（赛方 ACK / 提交回执），退出码 0 才算过
+ * - regex（默认）：satisfyFlagMode=any 时任一条 fact 匹配 flagPattern 即可；all 则逐条都要
+ * - local：同上，比对 expectedFlag
+ * - command：外部校验命令（赛方 ACK / 提交回执），退出码 0 才算过；
+ *   插件把 satisfiedBy 引用的全部 fact 交给命令（submit_flag 按合并文本抽 flag，不是逐条 AND）
  * - 其它/未识别/none：回退到 regex（fail-closed；要放行请把 flagPattern 显式设宽，
  *   让「本运行不做外部校验」这件事留在配置里可见，而不是把门拆掉）
  */
 export function makeVerifyHook(config) {
   const mode = config?.verifyMode ?? 'regex';
+  const satisfyFlagMode = satisfyFlagModeOf(config?.satisfyFlagMode);
   if (mode === 'local') {
     if (!config?.expectedFlag) {
       throw new Error('verifyMode=local 需要配置 expectedFlag');
     }
-    return makeLocalFlagVerify(config.expectedFlag);
+    return makeLocalFlagVerify(config.expectedFlag, { satisfyFlagMode });
   }
   if (mode === 'command') {
     if (!config?.verifyCommand) {
@@ -128,7 +163,7 @@ export function makeVerifyHook(config) {
     return makeCommandVerify(config.verifyCommand, { timeoutMs: config.verifyTimeoutMs });
   }
   const flags = String(config?.flagFlags ?? DEFAULT_FLAG_FLAGS).replace(/g/g, '');
-  return makeRegexFlagVerify(new RegExp(config?.flagPattern || DEFAULT_FLAG_PATTERN, flags));
+  return makeRegexFlagVerify(new RegExp(config?.flagPattern || DEFAULT_FLAG_PATTERN, flags), { satisfyFlagMode });
 }
 
 /** 辅助：workspace flag 文件内容（含换行清理）。 */

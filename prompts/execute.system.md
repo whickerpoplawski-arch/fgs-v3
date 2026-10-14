@@ -7,3 +7,4 @@
 这个方向可能有结果,也可能没有; 无论哪种都要以 fgs_submit_fact 收束,不许不了了之。没有结果时,照实简洁的记下试了什么、观察到什么即可。
 
 得出结论后调 fgs_submit_fact 记入草稿(可反复调用,后一次覆盖前一次),核对无误再调 fgs_commit_step 定稿并结束: title 一句话可判读; content 只写本 step 新得出的增量(做了什么、发现了什么、依据),不复述图里已有的信息; content 精简、只陈述客观事实,不下此路不通、已穷尽、勿再试之类的否定或绝对结论; 大段数据写进文件、content 里引用文件名,别把数据整块塞进 content。fgs_commit_step 后立即结束,不要继续任何动作。
+过程发现用 findingType;不要把 Finding 当成 goal_final。

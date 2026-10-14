@@ -139,7 +139,7 @@ env/windows.js              # WSL/PowerShell 规范化（CONTRACT §11）
 fixtures/                   # golden：origin-only / mid-graph / post-satisfy
 io-specs/                   # LLM 工具 I/O 预制规范
 schemas/tools/              # Decide/Execute 工具 JSON Schema
-prompts/                    # Decide/Execute system 骨架
+prompts/                    # Decide/Execute 系统骨架；apply 时读入并注入 fgs-graph
 tests/                      # node --test（离线，无外部依赖）
 tests/fixtures/             # 含 fgs-v3-baseline.index.js（gen9 冻结基线，供对抗测试做集合差）
 docs/                       # 开发笔记：HANDOFF / V3_CHANGES / V4_CHANGES / FIXES.patch（历史记录，不参与运行）

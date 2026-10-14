@@ -470,8 +470,8 @@ test('C4-d【修复】连续 6 条过期草稿全部保留、无静默丢失（�
   assert.doesNotMatch(text, /无有效产出/, '6 条草稿都在，不应有任何 step 谎报无有效产出');
 });
 
-test('C4-e：本文件跑在 v4（gen 11）上——代次自证', () => {
-  assert.equal(PLUGIN_GENERATION, 11);
+test('C4-e：本文件跑在 v4（gen 12）上——代次自证', () => {
+  assert.equal(PLUGIN_GENERATION, 12);
   assert.match(BUILD_TAG, /commit-per-step/);
   assert.match(BUILD_TAG, /orphan-visibility/);
   assert.match(BUILD_TAG, /readonly-decide-tools/);

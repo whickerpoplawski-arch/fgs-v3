@@ -46,7 +46,7 @@ export const name = 'fgs-deepseek';
  * 运行代次标记：只用于确认「磁盘上的新代码是否已被 Host 真正加载」。
  * 改代码后如果 /fgs/state 报的还是旧代次，说明进程仍跑着旧模块（需要重启/重载）。
  */
-export const PLUGIN_GENERATION = 11;
+export const PLUGIN_GENERATION = 12;
 
 /**
  * 面向人的构建标识：每次改动都必须往上滚一格。
@@ -54,9 +54,9 @@ export const PLUGIN_GENERATION = 11;
  * 之后再改代码，重启前后代次相同就区分不出新旧了（本项目踩过一次）。
  * `/fgs/state` 会原样返回 buildTag，重启后 curl 一眼即可确认新代码生效。
  */
-export const BUILD_TAG = '11+cairn-v2+commit-per-step+orphan-visibility'
+export const BUILD_TAG = '12+cairn-v2+commit-per-step+orphan-visibility'
   + '+readonly-decide-tools+claim-opened+ctx-budget+egress-tools'
-  + '+draft-no-loss+cap-in-forceclose+exec-ttl';
+  + '+draft-no-loss+cap-in-forceclose+exec-ttl+schema-ux+role-prompt';
 
 /** 本插件只硬依赖 tools；其余服务可选接入。 */
 export const inject = ['tools'];
@@ -227,6 +227,8 @@ const DEFAULT_CONFIG = Object.freeze({
   // 现在改为「同一 step 每回合至多一次 + 每回合总上限 N」，既不再逼人绕过黑板，
   // 又保留「单个 run 不许无限膨胀」的原意。
   maxCommitsPerRound: 4,
+  // satisfy_goal 的 flag 硬门：any = 任一条 satisfiedBy 含 flag 即可；all = 逐条都要。
+  satisfyFlagMode: 'any',
 });
 
 const PRIORITY_ORDER = { high: 0, normal: 1, low: 2 };
@@ -277,6 +279,7 @@ function normalizeConfig(raw) {
   cfg.deniedEnvTools = Array.isArray(cfg.deniedEnvTools) && cfg.deniedEnvTools.length > 0
     ? cfg.deniedEnvTools
     : DEFAULT_DENIED_ENV_TOOLS;
+  cfg.satisfyFlagMode = cfg.satisfyFlagMode === 'all' ? 'all' : 'any';
   return cfg;
 }
 
@@ -299,6 +302,15 @@ function ok(body) {
 function fail(body) {
   return { ok: false, text: body };
 }
+
+/** 真正失败：抛出让宿主把本次工具调用标成 isError（ok:false 的正文仍会被当成成功调用）。 */
+function failClaim(body) {
+  const error = new Error(body);
+  error.isError = true;
+  throw error;
+}
+
+const DECIDE_ENV_NEXT = '先 fgs_open_step + fgs_commit，再执行。';
 
 function toolResultSchema() {
   return {
@@ -1132,6 +1144,23 @@ function turnOf(ctx, agent) {
  * 读取预制 I/O 规范（CONTRACT §9）：把 io-specs/<role>.io.yaml 真的送进模型上下文，
  * 而不是只躺在仓库里当文档。
  */
+/**
+ * prompts/<role>.system.md 是该角色的系统骨架。
+ * 与 io-spec 一样在 apply 时读入，交给 fgs-graph 注入；不读的话文件只是仓库里的文档。
+ */
+function loadRolePrompt(role) {
+  try {
+    return readFileSync(new URL(`./prompts/${role}.system.md`, import.meta.url), 'utf8').trim();
+  } catch (err) {
+    try {
+      console.warn(`[fgs] prompts/${role}.system.md 读取失败，已跳过注入: ${err?.message}`);
+    } catch {
+      /* 诊断输出失败不得影响加载 */
+    }
+    return '';
+  }
+}
+
 function loadIoSchema(role) {
   try {
     const raw = readFileSync(new URL(`./io-specs/${role}.io.yaml`, import.meta.url), 'utf8');
@@ -1488,7 +1517,12 @@ function registerTools(ctx, cfg, runs, registries, detached) {
     toolName: 'fgs_preview',
     description: '只读投影当前图（fact 只给 id+title）并附未提交草稿。规划前先看这个。',
     parameters: { type: 'object', properties: {}, additionalProperties: false },
-    run: (_args, exec) => {
+    run: (args, exec) => {
+      const unknown = Object.keys(args ?? {});
+      if (unknown.length > 0) {
+        return fail(`fgs_preview 不接受任何参数（收到: ${unknown.join(', ')}）。\n`
+          + '它只返回只读投影；要看计数摘要用 fgs_status。');
+      }
       const run = active(exec);
       const graph = run.store.load();
       const parts = [run.store.preview(graph)];
@@ -1507,7 +1541,7 @@ function registerTools(ctx, cfg, runs, registries, detached) {
         from: { type: 'array', items: { type: 'string' }, description: '本步骤依赖的 fact id 列表，不能为空。' },
         priority: { type: 'string', enum: ['high', 'normal', 'low'], description: '默认 normal。' },
         actor: { type: 'string', description: '默认 agent。' },
-        stepId: { type: 'string', description: '可选，预分配 step_NNN（batch commit 用）。' },
+        stepId: { type: 'string', description: '可选，预分配 step_NNN（如 step_001）。step_recon 这类非法 id 会拒收；留空则自动分配。' },
       },
       required: ['action', 'from'],
       additionalProperties: false,
@@ -1607,12 +1641,12 @@ function registerTools(ctx, cfg, runs, registries, detached) {
       const run = active(exec);
       const graph = run.store.load();
       const step = openStepsOf(graph).find((s) => s.id === args.stepId);
-      if (!step) return fail(`step ${args.stepId} 不是 open step，无法认领。`);
+      if (!step) failClaim(`step ${args.stepId} 不是 open step，无法认领。`);
       try {
         const next = run.controller.apply(claimStepOp({ stepId: args.stepId, owner: run.sid }), graph);
         run.controller.commit(next);
       } catch (error) {
-        if (error?.name === 'WriteRejected') return fail(`claim_step 拒收: ${error.message}`);
+        if (error?.name === 'WriteRejected') failClaim(`claim_step 拒收: ${error.message}`);
         throw error;
       }
       refreshRole(run);
@@ -1701,7 +1735,13 @@ function registerTools(ctx, cfg, runs, registries, detached) {
           items: {
             type: 'object',
             properties: {
-              op: { type: 'string', enum: ['open_step', 'drop_step', 'change_step_priority', 'satisfy_goal', 'reopen'] },
+              op: {
+                type: 'string',
+                enum: [
+                  'open_step', 'drop_step', 'change_step_priority', 'satisfy_goal', 'reopen',
+                  'add_subgoal', 'drop_subgoal', 'claim_step',
+                ],
+              },
               action: { type: 'string' },
               from: { type: 'array', items: { type: 'string' } },
               priority: { type: 'string' },
@@ -1711,6 +1751,9 @@ function registerTools(ctx, cfg, runs, registries, detached) {
               goalId: { type: 'string' },
               satisfiedBy: { type: 'array', items: { type: 'string' } },
               feedbackTitle: { type: 'string' },
+              criterion: { type: 'string' },
+              parentId: { type: 'string' },
+              owner: { type: 'string' },
             },
             required: ['op'],
             additionalProperties: false,
@@ -2196,6 +2239,7 @@ export function apply(ctx, config = {}) {
   };
   const ioSpecs = { decide: loadIoSchema('decide'), execute: loadIoSchema('execute') };
   const ioSchemaFor = (role) => ioSpecs[role] ?? null;
+  const rolePrompts = { decide: loadRolePrompt('decide'), execute: loadRolePrompt('execute') };
 
   hold(registerTools(ctx, cfg, runs, registries, detached));
 
@@ -2247,12 +2291,12 @@ export function apply(ctx, config = {}) {
       if (cfg.deniedEnvTools.includes(tool)) {
         return `FGS Decide 会话禁止环境执行工具 ${tool}（CONTRACT §4）：`
           + ' Decide 只做规划/改图；需要执行时先 fgs_open_step + fgs_commit 打开 step，'
-          + '进 Execute 轮后才允许环境工具。';
+          + `进 Execute 轮后才允许环境工具。\n${DECIDE_ENV_NEXT}`;
       }
       if (!decideAllows(cfg, tool)) {
         return `FGS Decide 会话禁止调用 ${tool}（CONTRACT §4：Decide 只做规划/改图，`
           + '禁止 bash/文件/网络/委派等一切环境工具）。'
-          + ' 需要在环境里动作时，先 fgs_open_step + fgs_commit 打开 step，进 Execute 轮再执行。';
+          + ` 需要在环境里动作时，先 fgs_open_step + fgs_commit 打开 step，进 Execute 轮再执行。\n${DECIDE_ENV_NEXT}`;
       }
     }
     return undefined;
@@ -2368,6 +2412,7 @@ export function apply(ctx, config = {}) {
             graphMutationTools: GRAPH_MUTATION_TOOLS,
             executeDeniedGraphTools: EXECUTE_DENIED_GRAPH_TOOLS,
             injectMaxChars: run.cfg?.injectMaxChars ?? 24000,
+            rolePrompt: rolePrompts[run.role] ?? '',
             // v3（缺陷 K/L）：注入面必须知道「我是谁」和「租约多长」，
             // 才能把 mine / unclaimed / 可接手(租约已过期) 标在 open steps 那一行上。
             sid: run.sid,
