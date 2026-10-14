@@ -9,7 +9,7 @@
  *   { goalId, reason, satisfiedBy: [...], facts: [{ id, title, content }] }
  *
  * 行为:
- *   1) 从 facts 文本里抽出所有 flag 形态（默认 flag{...}，大小写不敏感）
+ *   1) 从 facts 合并文本抽出 flag（任一条含 flag 即可；不是逐条 AND）
  *   2) 逐个 POST 到赛方提交接口
  *   3) 200/201 = 正确；409 = 重复提交（说明此前已判对）→ 也按通过
  *   4) 全部通过才 exit 0；任一失败 exit 1，并在 stdout 打出 {"ok":false,"reason":...}

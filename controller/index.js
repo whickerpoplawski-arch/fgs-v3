@@ -516,7 +516,9 @@ export class Controller {
     }
     const sid = op.stepId || this.store.nextStepId(graph);
     if (!(typeof sid === 'string' && sid.startsWith('step_') && /^\d+$/.test(sid.slice(5)))) {
-      throw new WriteRejected(`step id 非法（须 step_NNN）: ${sid}`);
+      throw new WriteRejected(
+        `step id 非法（须 step_NNN，例如 step_001）: ${sid}。勿把动作名当 id；留空则自动分配。`,
+      );
     }
     if (graph.steps.some((s) => s.id === sid)) throw new WriteRejected(`step id 已存在: ${sid}`);
     const factIds = new Set(graph.facts.map((f) => f.id));

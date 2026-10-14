@@ -114,14 +114,31 @@ export function makeFakeHost() {
     if (!definition) return { ok: false, text: `UNKNOWN_TOOL ${name}`, denied: null };
     const denied = invokeGuard(name, args, agent);
     if (denied !== null) return { ok: false, text: denied, denied };
-    const value = await definition.execute(args, {
-      name,
-      arguments: args,
-      agent,
-      concludeTurn() {
-        if (agent) agent.concluded = true;
-      },
-    });
+    let value;
+    try {
+      value = await definition.execute(args, {
+        name,
+        arguments: args,
+        agent,
+        concludeTurn() {
+          if (agent) agent.concluded = true;
+        },
+      });
+    } catch (error) {
+      // 宿主对 execute 抛错记 isError=true（ok:false 的正常返回不会）。
+      if (error?.isError === true) {
+        const message = String(error.message ?? error);
+        return {
+          ok: false,
+          isError: true,
+          text: message,
+          value: null,
+          content: [{ type: 'text', text: `Error: ${message}` }],
+          denied: null,
+        };
+      }
+      throw error;
+    }
     const content = definition.output.render(args, value);
     return { ok: value.ok, text: value.text, value, content };
   };

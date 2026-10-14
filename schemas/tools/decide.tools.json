@@ -44,7 +44,7 @@
           },
           "actor": { "type": "string", "description": "默认 agent" },
           "priority": { "type": "string", "enum": ["high", "normal", "low"], "description": "默认 normal" },
-          "stepId": { "type": "string", "description": "可选预分配 step_NNN" }
+          "stepId": { "type": "string", "description": "可选预分配 step_NNN（如 step_001）；非法 id 如 step_recon 会拒收，留空则自动分配" }
         }
       }
     }
@@ -135,7 +135,7 @@
               "type": "object",
               "required": ["op"],
               "properties": {
-                "op": { "type": "string", "enum": ["open_step", "drop_step", "change_step_priority", "satisfy_goal", "reopen"] },
+                "op": { "type": "string", "enum": ["open_step", "drop_step", "change_step_priority", "satisfy_goal", "reopen", "add_subgoal", "drop_subgoal", "claim_step"] },
                 "stepId": { "type": "string" },
                 "action": { "type": "string" },
                 "actor": { "type": "string" },
@@ -143,6 +143,9 @@
                 "priority": { "type": "string", "enum": ["high", "normal", "low"] },
                 "reason": { "type": "string" },
                 "goalId": { "type": "string" },
+                "criterion": { "type": "string" },
+                "parentId": { "type": "string" },
+                "owner": { "type": "string" },
                 "satisfiedBy": { "type": "array", "items": { "type": "string" } },
                 "feedbackTitle": { "type": "string" }
               }
