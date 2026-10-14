@@ -662,11 +662,11 @@ test('F6b【脆弱性】：yaml.js 仍不支持多行纯量——io-spec notes �
 
 /* ==================================================================== 代次 */
 
-test('代次自证：PLUGIN_GENERATION=10，BUILD_TAG 保留原关键子串', () => {
-  assert.equal(PLUGIN_GENERATION, 10);
+test('代次自证：PLUGIN_GENERATION=11，BUILD_TAG 保留原关键子串', () => {
+  assert.equal(PLUGIN_GENERATION, 11);
   for (const sub of ['cairn-v2', 'commit-per-step', 'orphan-visibility',
     'readonly-decide-tools', 'claim-opened', 'ctx-budget', 'egress-tools']) {
     assert.match(BUILD_TAG, new RegExp(sub.replace(/[+]/g, '\\+')), `BUILD_TAG 丢失子串 ${sub}`);
   }
-  assert.match(BUILD_TAG, /^10\+/);
+  assert.match(BUILD_TAG, /^11\+/);
 });

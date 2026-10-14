@@ -27,6 +27,7 @@ import {
   dropSubGoalOp,
   dropStepOp,
   openStepOp,
+  releaseStepOp,
   reopenOp,
   satisfyGoalOp,
   seedOriginOp,
@@ -45,7 +46,7 @@ export const name = 'fgs-deepseek';
  * 运行代次标记：只用于确认「磁盘上的新代码是否已被 Host 真正加载」。
  * 改代码后如果 /fgs/state 报的还是旧代次，说明进程仍跑着旧模块（需要重启/重载）。
  */
-export const PLUGIN_GENERATION = 10;
+export const PLUGIN_GENERATION = 11;
 
 /**
  * 面向人的构建标识：每次改动都必须往上滚一格。
@@ -53,9 +54,9 @@ export const PLUGIN_GENERATION = 10;
  * 之后再改代码，重启前后代次相同就区分不出新旧了（本项目踩过一次）。
  * `/fgs/state` 会原样返回 buildTag，重启后 curl 一眼即可确认新代码生效。
  */
-export const BUILD_TAG = '10+cairn-v2+commit-per-step+orphan-visibility'
+export const BUILD_TAG = '11+cairn-v2+commit-per-step+orphan-visibility'
   + '+readonly-decide-tools+claim-opened+ctx-budget+egress-tools'
-  + '+draft-no-loss+cap-in-forceclose';
+  + '+draft-no-loss+cap-in-forceclose+exec-ttl';
 
 /** 本插件只硬依赖 tools；其余服务可选接入。 */
 export const inject = ['tools'];
@@ -211,6 +212,8 @@ const DEFAULT_CONFIG = Object.freeze({
   // stepDraftTtlMs = 未收束草稿的存活上限；超期在 refreshRole 时清理，防僵尸草稿。
   stepLeaseMs: 30 * 60 * 1000,
   stepDraftTtlMs: 60 * 60 * 1000,
+  // 单题 Execute 会话墙钟。与 stepLeaseMs（认领租约）正交：到期写未完成 Fact 并释放认领。
+  executeSessionTtlMs: 10 * 60 * 1000,
   // v2：Finding = 搜索过程的结构化产物；类型**可动态定义**。
   // 留空数组 = 不限制取值（自由定义）；给定 = 白名单。
   findingTypes: [],
@@ -456,7 +459,7 @@ function projectSwitch(agent, cfg, runs, registries, detached, rawId) {
   return { ok: true, text: `已切换活动 Project → ${id}（${tail}）。` };
 }
 
-/** 列出全部 Project 及其角色/进度。 */
+/** 列出全部 Project 及其角色/进度。有 deferred 题时，非 deferred 排在前面。 */
 function projectList(agent, cfg, runs, registries) {
   const registry = registryFor(agent, cfg, registries);
   if (!registry) return { ok: false, text: '无法定位 workspace（agent 没有 cwd）。' };
@@ -465,8 +468,24 @@ function projectList(agent, cfg, runs, registries) {
     return { ok: true, text: '（无 Project）用 fgs_project action=new problemId=<id> brief=<题目> 建立。' };
   }
   const activeId = registry.getActive();
-  const lines = items.map((item) => {
+  const views = problemViews(registry);
+  const next = pickScheduleTarget(registry);
+  const deferredExists = views.some((v) => v.deferred);
+  const viewOf = (id) => views.find((v) => v.id === id);
+  const rank = (id) => {
+    const view = viewOf(id);
+    if (view?.workable) return 0;
+    if (view?.deferred) return 1;
+    return 2;
+  };
+  const ordered = deferredExists
+    ? [...items].sort((a, b) => rank(a.id) - rank(b.id) || items.indexOf(a) - items.indexOf(b))
+    : items;
+  const lines = [];
+  if (deferredExists) lines.push(scheduleHeader(next));
+  for (const item of ordered) {
     const mark = item.id === activeId ? '*' : ' ';
+    const tag = deferredExists ? scheduleTag(viewOf(item.id), next) : '';
     try {
       const store = new GraphStore(registry.projectRoot(item.id), cfg);
       const graph = store.load();
@@ -474,11 +493,12 @@ function projectList(agent, cfg, runs, registries) {
       const role = seeded ? roleLabel(derivedRole(graph)) : 'unseeded';
       const open = openStepsOf(graph).length;
       const satisfied = goalSatisfied(graph) ? 'yes' : 'no';
-      return `${mark} ${item.id}  title=${item.title}  role=${role}  open=${open}  satisfied=${satisfied}  state=${item.state}`;
+      const state = viewOf(item.id)?.state ?? item.state;
+      lines.push(`${mark} ${item.id}  title=${item.title}  role=${role}  open=${open}  satisfied=${satisfied}  state=${state}${tag}`);
     } catch (error) {
-      return `${mark} ${item.id}  [读取失败: ${error.message}]`;
+      lines.push(`${mark} ${item.id}  [读取失败: ${error.message}]`);
     }
-  });
+  }
   return { ok: true, text: lines.join('\n') };
 }
 
@@ -518,6 +538,8 @@ function createRun(agent, cfg, registry, problemId) {
     commitsThisRound: 0,
     stepsOpenedRound: null,
     stepsOpenedIds: null,
+    registry,
+    executeStartedAt: null,
   };
 }
 
@@ -582,9 +604,12 @@ function deriveProjectState(graph) {
 
 function syncProjectMeta(registry, run, graph) {
   if (!registry || !run) return;
-  const state = deriveProjectState(graph);
+  const derived = deriveProjectState(graph);
   const prev = registry.readMeta(run.problemId) ?? {};
-  registry.writeMeta(run.problemId, {
+  const solved = derived === 'solved';
+  const stayDeferred = !solved && prev.state === 'deferred';
+  const state = stayDeferred ? 'deferred' : derived;
+  const meta = {
     id: run.problemId,
     title: prev.title ?? run.problemId,
     state,
@@ -593,7 +618,13 @@ function syncProjectMeta(registry, run, graph) {
     roundSeq: run.roundSeq ?? 0,
     createdAt: prev.createdAt ?? new Date().toISOString(),
     updatedAt: new Date().toISOString(),
-  });
+  };
+  if (stayDeferred) {
+    meta.deferredAt = prev.deferredAt ?? null;
+    meta.deferredReason = prev.deferredReason ?? null;
+    meta.unfinishedFactId = prev.unfinishedFactId ?? null;
+  }
+  registry.writeMeta(run.problemId, meta);
   registry.setProblemState(run.problemId, state);
 }
 
@@ -641,6 +672,7 @@ function diskSnapshot(registry, problemId, cfg) {
     decideDraft: [],
     execDraft: null,
     role: 'decide',
+    meta,
   });
 }
 
@@ -794,14 +826,250 @@ function expiredDraftAsFact(d, stepId) {
  * —— 不可自愈死锁；同时因为不是 decide，§4「Decide 禁止环境工具」也就形同虚设。
  * 现在改为每次都由 (图, sid) 现算，并从图上认领任务，两个问题一并消除。
  */
+function sessionNow(run) {
+  const clock = run?.cfg?.now;
+  if (typeof clock === 'function') {
+    const n = Number(clock());
+    if (Number.isFinite(n)) return n;
+  }
+  return Date.now();
+}
+
+function executeTtlMs(cfg) {
+  const n = Number(cfg?.executeSessionTtlMs ?? DEFAULT_CONFIG.executeSessionTtlMs);
+  return Number.isFinite(n) ? n : DEFAULT_CONFIG.executeSessionTtlMs;
+}
+
+function executeExpired(run, now) {
+  const ttl = executeTtlMs(run?.cfg);
+  if (!(ttl > 0) || !Number.isFinite(run?.executeStartedAt)) return false;
+  return now - run.executeStartedAt >= ttl;
+}
+
+function clipChars(text, max) {
+  const chars = [...String(text ?? '')];
+  if (chars.length <= max) return chars.join('');
+  return `${chars.slice(0, Math.max(1, max - 1)).join('')}…`;
+}
+
+function problemViews(registry) {
+  if (!registry) return [];
+  return registry.list().map((item) => {
+    let meta = null;
+    try {
+      meta = registry.readMeta(item.id);
+    } catch {
+      meta = null;
+    }
+    const state = meta?.state ?? item.state ?? 'created';
+    return {
+      id: item.id,
+      state,
+      deferred: state === 'deferred',
+      solved: state === 'solved',
+      workable: state === 'seeded' || state === 'running',
+      meta: meta ?? {},
+    };
+  });
+}
+
+function pickScheduleTarget(registry) {
+  const views = problemViews(registry);
+  const primary = views.find((view) => view.workable);
+  if (primary) return { ...primary, wave: 'primary' };
+  const cleanup = views.find((view) => view.deferred);
+  if (cleanup) return { ...cleanup, wave: 'cleanup' };
+  return null;
+}
+
+function scheduleHeader(next) {
+  if (!next) return 'schedule: none';
+  if (next.wave === 'cleanup') {
+    return `schedule: next=${next.id} wave=cleanup（没有非 deferred 可做题，允许收尾调度）`;
+  }
+  return `schedule: next=${next.id} wave=primary（跳过 deferred，不自动认领/切换到 deferred）`;
+}
+
+function scheduleTag(view, next) {
+  if (!view || view.solved || view.state === 'created') return '';
+  if (view.deferred) {
+    return next?.wave === 'cleanup' && next.id === view.id ? ' schedule=now' : ' schedule=later';
+  }
+  if (view.workable) return ' schedule=now';
+  return '';
+}
+
+function shouldSkipAutoClaim(registry, problemId) {
+  if (!registry || !problemId) return false;
+  const views = problemViews(registry);
+  const current = views.find((view) => view.id === problemId);
+  if (!current?.deferred) return false;
+  return views.some((view) => view.workable);
+}
+
+function describeTried(run, step) {
+  const draft = run.execDraft;
+  if (draft && (!draft.stepId || draft.stepId === step.id)) {
+    const title = clipChars(draft.title, 80) || '(无标题)';
+    const content = clipChars(draft.content, 500);
+    return `已试：${title}${content ? ` — ${content}` : ''}`;
+  }
+  const expired = Array.isArray(run.expiredDrafts)
+    ? run.expiredDrafts.filter((d) => !d.stepId || d.stepId === step.id)
+    : [];
+  if (expired.length > 0) {
+    const last = expired[expired.length - 1];
+    return `已试：${clipChars(last.title, 80) || '(无标题)'} — ${clipChars(last.content, 500)}`;
+  }
+  return '已试：没有未提交草稿。';
+}
+
+function unfinishedLines(graph) {
+  const lines = [];
+  for (const step of graph?.steps ?? []) {
+    if (step.state !== 'open' || !step.linkedUnfinishedFactId) continue;
+    const fact = (graph.facts ?? []).find((item) => item.id === step.linkedUnfinishedFactId);
+    if (!fact?.content) continue;
+    lines.push(`【未完成 Fact】${fact.id} ← ${step.id}（step 仍 open，认领已释放） ${clipChars(fact.content, 500)}`);
+  }
+  return lines.join('\n');
+}
+
+function contextScheduleNote(registry, run, graph) {
+  const parts = [];
+  const views = problemViews(registry);
+  if (views.some((view) => view.deferred)) {
+    const next = pickScheduleTarget(registry);
+    parts.push(`【调度】${scheduleHeader(next)}`);
+    const current = views.find((view) => view.id === run?.problemId);
+    if (current?.deferred && next?.wave === 'primary') {
+      parts.push('本题已 deferred：跳过自动认领/切换，先做非 deferred 题。');
+    }
+  }
+  const bodies = unfinishedLines(graph);
+  if (bodies) parts.push(bodies);
+  return parts.join('\n');
+}
+
+function appendScheduleLines(lines, registry, graph) {
+  const views = problemViews(registry);
+  if (views.some((view) => view.deferred)) {
+    const next = pickScheduleTarget(registry);
+    lines.push(scheduleHeader(next));
+    for (const view of views) {
+      if (!view.deferred) continue;
+      const when = (scheduleTag(view, next).trim() || 'schedule=later');
+      lines.push(`deferred ${view.id} ${when} reason=${view.meta?.deferredReason ?? ''} fact=${view.meta?.unfinishedFactId ?? ''}`);
+    }
+  }
+  const bodies = unfinishedLines(graph);
+  if (bodies) lines.push(bodies);
+}
+
+function markDeferred(registry, run, unfinishedFactId) {
+  if (!registry || !run?.problemId) return;
+  const prev = registry.readMeta(run.problemId) ?? {};
+  const deferredAt = new Date().toISOString();
+  registry.writeMeta(run.problemId, {
+    id: run.problemId,
+    title: prev.title ?? run.problemId,
+    state: 'deferred',
+    model: prev.model ?? null,
+    budget: prev.budget ?? null,
+    roundSeq: prev.roundSeq ?? run.roundSeq ?? 0,
+    createdAt: prev.createdAt ?? deferredAt,
+    updatedAt: deferredAt,
+    deferredAt,
+    deferredReason: 'execute_timeout',
+    unfinishedFactId: unfinishedFactId ?? prev.unfinishedFactId ?? null,
+  });
+  registry.setProblemState(run.problemId, 'deferred');
+}
+
+function maybeRetarget(registry, deferredId) {
+  if (!registry || !deferredId) return;
+  const next = pickScheduleTarget(registry);
+  if (!next || next.deferred || next.id === deferredId) return;
+  if (registry.getActive() === deferredId) registry.setActive(next.id);
+}
+
+function finishExecuteSession(run, stepId) {
+  if (run.execDraft && (!run.execDraft.stepId || run.execDraft.stepId === stepId)) {
+    run.execDraft = null;
+    run.execDraftAt = null;
+  }
+  if (Array.isArray(run.expiredDrafts)) {
+    run.expiredDrafts = run.expiredDrafts.filter((d) => d.stepId && d.stepId !== stepId);
+    if (run.expiredDrafts.length === 0) run.draftExpired = false;
+  }
+  run.executeStartedAt = null;
+  run.currentStepId = null;
+  run.role = 'decide';
+  run.dispatch = 'claimable';
+}
+
+function currentOwnedStep(run, owned) {
+  if (run.currentStepId) {
+    const hit = owned.find((step) => step.id === run.currentStepId);
+    if (hit) return hit;
+  }
+  if (run.execDraft?.stepId) {
+    const hit = owned.find((step) => step.id === run.execDraft.stepId);
+    if (hit) return hit;
+  }
+  return owned[0];
+}
+
+/** 幂等：未完成 Fact → 释放认领 → deferred → 清草稿并离开 Execute。 */
+function timeoutSettle(run, step) {
+  const registry = run.registry ?? null;
+  const live = run.store.load();
+  const current = (live.steps ?? []).find((item) => item.id === step.id);
+  if (!current || current.state !== 'open' || (current.owner && current.owner !== run.sid)) {
+    finishExecuteSession(run, step.id);
+    return live;
+  }
+  if (!current.owner && current.linkedUnfinishedFactId) {
+    markDeferred(registry, run, current.linkedUnfinishedFactId);
+    finishExecuteSession(run, current.id);
+    maybeRetarget(registry, run.problemId);
+    return live;
+  }
+  const action = clipChars(String(current.action ?? '').replace(/\s+/g, ' '), 80);
+  const title = clipChars(`未完成：${current.id} Execute 会话超时`, 120);
+  const content = [
+    `卡在：${current.id}${action ? `（${action}）` : ''}，step 仍为 open。`,
+    describeTried(run, current),
+    '为何停：execute_session_ttl 超时。',
+  ].join('\n');
+  const next = run.controller.apply(
+    releaseStepOp({ stepId: current.id, factTitle: title, factContent: content }),
+    live,
+  );
+  run.controller.commit(next);
+  const updated = next.steps.find((item) => item.id === current.id);
+  markDeferred(registry, run, updated?.linkedUnfinishedFactId ?? null);
+  finishExecuteSession(run, current.id);
+  maybeRetarget(registry, run.problemId);
+  return next;
+}
+
 function refreshRole(run) {
+  const now = sessionNow(run);
   const cfg = run.cfg ?? DEFAULT_CONFIG;
   const leaseMs = cfg.stepLeaseMs ?? 0;
-  const graph = run.store.load();
+  if (executeExpired(run, now)) {
+    const graph0 = run.store.load();
+    const mine0 = openStepsOf(graph0).filter((s) => stepOwnerOf(s) === run.sid);
+    if (mine0.length > 0) timeoutSettle(run, currentOwnedStep(run, mine0));
+    else run.executeStartedAt = null;
+  }
   expireStaleDraft(run, cfg);
+  const graph = run.store.load();
   const open = openStepsOf(graph);
   const mine = open.filter((s) => stepOwnerOf(s) === run.sid);
   if (mine.length > 0) {
+    if (!Number.isFinite(run.executeStartedAt)) run.executeStartedAt = now;
     run.role = 'execute';
     run.currentStepId = mine[0].id;
     run.dispatch = 'owned';
@@ -815,9 +1083,10 @@ function refreshRole(run) {
   // 这样 Step↔Run 的绑定永远是一次可审计的显式派发（v1 Dispatcher 语义在这儿落地）。
   run.role = 'decide';
   run.currentStepId = null;
-  const now = Date.now();
+  run.executeStartedAt = null;
+  const leaseNow = Date.now();
   run.dispatch = open.length === 0 ? 'none'
-    : open.some((s) => !claimFresh(s, now, leaseMs)) ? 'claimable' : 'held-by-others';
+    : open.some((s) => !claimFresh(s, leaseNow, leaseMs)) ? 'claimable' : 'held-by-others';
   return graph;
 }
 
@@ -926,6 +1195,15 @@ function graphSnapshot(run) {
   if (graph.facts.length === 0 && graph.goals.length === 0 && graph.steps.length === 0) {
     return inactivePayload();
   }
+  let meta = null;
+  if (run.registry && run.problemId) {
+    try {
+      meta = run.registry.readMeta(run.problemId);
+    } catch {
+      meta = null;
+    }
+  }
+  if (!meta) meta = run.meta ?? null;
   return {
     active: true,
     pluginGeneration: PLUGIN_GENERATION,
@@ -943,6 +1221,9 @@ function graphSnapshot(run) {
     dispatch: dispatch.kind, // owned | claim | held-by-others | none
     reachable: run.reachable,
     satisfied: goalSatisfied(graph),
+    deferred: meta?.state === 'deferred',
+    deferredReason: meta?.deferredReason ?? null,
+    unfinishedFactId: meta?.unfinishedFactId ?? null,
     currentStepId: run.currentStepId,
     ownedStepId: ownedStep?.id ?? null,
     draft: draftSummary(run),
@@ -988,6 +1269,8 @@ function graphSnapshot(run) {
       state: s.state,
       priority: s.priority,
       to: s.to ?? null,
+      owner: s.owner ?? null,
+      linkedUnfinishedFactId: s.linkedUnfinishedFactId ?? null,
     })),
     updatedAt: new Date().toISOString(),
   };
@@ -1105,7 +1388,7 @@ function registerTools(ctx, cfg, runs, registries, detached) {
       }
       // 认领（attach）：磁盘已种题的 Project 直接建 run + refreshRole，
       // 不看「内存里有没有 run」——否则重启/换会话后会误报「尚未种题」。
-      const { problemId, run, reason } = attachRun(exec?.agent, cfg, runs, registries, detached);
+      const { registry, problemId, run, reason } = attachRun(exec?.agent, cfg, runs, registries, detached);
       if (reason === 'no-project') {
         return ok('FGS 未启动（没有活动 Project：先 fgs_project action=new problemId=<id> brief=<题目>，或 /fgs new <id>「题目」）。');
       }
@@ -1153,6 +1436,7 @@ function registerTools(ctx, cfg, runs, registries, detached) {
       const draft = draftSummary(run);
       if (draft) lines.push(`草稿: ${draft}`);
       if (run.draftExpired) lines.push('⚠️ 上一条未收束的草稿已按 stepDraftTtlMs 过期回收。');
+      appendScheduleLines(lines, registry, graph);
       return ok(lines.join('\n'));
     },
   }));
@@ -1492,7 +1776,10 @@ function registerTools(ctx, cfg, runs, registries, detached) {
         // `openUnclaimed` 恒为 0；「未认领或租约过期的 step 可被任何会话认领」这句话
         // 在**图里没有任何一个未认领的 step**时是死条款，worker 一个任务都领不到，
         // 还要干等 stepLeaseMs(30min) 才可能接手。因此派发任务池时必须传 `claimOpened:false`。
-        const autoClaim = args.claimOpened !== false;
+        // deferred 且还有非 deferred 题时，也不自动认领（显式 fgs_claim_step 仍可再进入）。
+        const openedRegistry = registryFor(exec?.agent, cfg, registries);
+        const skipAutoClaim = shouldSkipAutoClaim(openedRegistry, run.problemId);
+        const autoClaim = args.claimOpened !== false && !skipAutoClaim;
         if (autoClaim) {
           for (const sid of openedNow) {
             try {
@@ -1503,16 +1790,20 @@ function registerTools(ctx, cfg, runs, registries, detached) {
           }
         }
       }
-      syncProjectMeta(registryFor(exec?.agent, cfg, registries), run, working);
+      const commitRegistry = registryFor(exec?.agent, cfg, registries);
+      syncProjectMeta(commitRegistry, run, working);
       refreshRole(run);
       const satisfied = goalSatisfied(working);
       if (satisfied && typeof exec?.concludeTurn === 'function') exec.concludeTurn();
       const openNow = openStepsOf(working);
+      const nextProblem = commitRegistry ? pickScheduleTarget(commitRegistry) : null;
       const tail = satisfied
         ? 'goal_final 已满足，停止。'
-        : (openNow.length > 0
-          ? `下一步进入 Execute：${openNow[0].id} [${openNow[0].priority}] ${openNow[0].action}`
-          : '暂无 open step：继续 Decide。');
+        : (shouldSkipAutoClaim(commitRegistry, run.problemId) && nextProblem
+          ? `本题已 deferred，不自动认领。优先 ${nextProblem.id}（非 deferred 做完前不自动切到 deferred）。`
+          : (openNow.length > 0
+            ? `下一步进入 Execute：${openNow[0].id} [${openNow[0].priority}] ${openNow[0].action}`
+            : '暂无 open step：继续 Decide。'));
       return ok(`已提交 ${applied.length} 项: ${applied.join(', ')}\n${tail}`);
     },
   }));
@@ -1784,6 +2075,17 @@ function resolveRoundStep(run, graph, stepId) {
  * 失败只记账不抛：收束失败绝不能阻断回合结束。
  */
 function forceCloseStep(run, turn, registry) {
+  if (executeExpired(run, sessionNow(run))) {
+    const graphNow = run.store.load();
+    const mine = openStepsOf(graphNow).filter((s) => stepOwnerOf(s) === run.sid);
+    if (mine.length > 0) {
+      if (!run.registry && registry) run.registry = registry;
+      timeoutSettle(run, currentOwnedStep(run, mine));
+      return true;
+    }
+    run.executeStartedAt = null;
+    run.role = 'decide';
+  }
   const { round, limited } = observeRound(run, turn);
   if (run.role !== 'execute') return false;
   // v4（F4）：兜底收束也必须受 maxCommitsPerRound 约束（cap 取值与 commit_step 同源）；
@@ -2048,7 +2350,7 @@ export function apply(ctx, config = {}) {
         const sid = sessionIdOf(scope);
         if (!sid || sid === 'unknown') return '';
         // 只注入本会话 × 活动 Project 的 run，不回退到别的题或别的会话。
-        const { run } = activeRun(scope);
+        const { registry, run } = activeRun(scope);
         if (!run || run.sid !== sid) return '';
         try {
           // 注入上下文同样必须现算角色：旧实现直接用缓存 run.role，
@@ -2070,6 +2372,7 @@ export function apply(ctx, config = {}) {
             // 才能把 mine / unclaimed / 可接手(租约已过期) 标在 open steps 那一行上。
             sid: run.sid,
             stepLeaseMs: run.cfg?.stepLeaseMs ?? 0,
+            scheduleNote: contextScheduleNote(registry, run, graph),
           });
         } catch (error) {
           return `【FGS 图读取失败】${error?.message ?? error}`;

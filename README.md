@@ -197,7 +197,10 @@ docs/                       # 开发笔记：HANDOFF / V3_CHANGES / V4_CHANGES /
         deniedEnvTools: [bash, read, write, edit, glob, grep, ...]
         exposeHttpState: true          # 给 Web 面板的只读快照路由
         httpPath: /fgs/state
+        executeSessionTtlMs: 600000    # 单题 Execute 墙钟，默认 10 分钟
 ```
+
+`executeSessionTtlMs` 到期：写一条未完成 Fact，释放当前 open step 的认领（step 仍 open），题目标 `deferred`。有非 deferred 题时不自动认领/切到 deferred。`stepLeaseMs`（默认 30 分钟）只是认领租约，过期后别的会话可以 `claim_step`；它不写未完成 Fact，也不被会话 TTL 替换。
 
 FLAG 硬门**不可关闭**（`CONTRACT §8`）：`verifyMode` 没有 `none`，未识别/`none` 一律
 fail-closed 回退到 regex。要放行请把 `flagPattern` 显式设宽——让「本运行不做外部校验」
