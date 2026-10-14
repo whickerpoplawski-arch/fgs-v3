@@ -31,9 +31,12 @@ export function roleContextText({
   role, store, graph, currentStep = null, draftSummary = '', ioSpec = null,
   graphMutationTools = null, executeDeniedGraphTools = null, injectMaxChars = 24000,
   sid = null, stepLeaseMs = 0, now = Date.now(), scheduleNote = '',
+  rolePrompt = '',
 }) {
   if (!graph || !store) return '';
   const lines = [`【FGS 当前角色】${roleLabel(role)}`];
+  // prompts/<role>.system.md：冷启动 / SubGoal / Finding 等姿态。按角色注入，不进另一角色。
+  if (typeof rolePrompt === 'string' && rolePrompt.trim()) lines.push(rolePrompt.trim());
   const openSteps = (graph.steps ?? []).filter((s) => s.state === 'open');
   if (role === 'execute') {
     if (currentStep) lines.push(`【本轮必须收束的 step】${currentStep.id}: ${currentStep.action}`);

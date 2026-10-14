@@ -56,7 +56,7 @@ export const PLUGIN_GENERATION = 12;
  */
 export const BUILD_TAG = '12+cairn-v2+commit-per-step+orphan-visibility'
   + '+readonly-decide-tools+claim-opened+ctx-budget+egress-tools'
-  + '+draft-no-loss+cap-in-forceclose+exec-ttl+schema-ux';
+  + '+draft-no-loss+cap-in-forceclose+exec-ttl+schema-ux+role-prompt';
 
 /** 本插件只硬依赖 tools；其余服务可选接入。 */
 export const inject = ['tools'];
@@ -1144,6 +1144,23 @@ function turnOf(ctx, agent) {
  * 读取预制 I/O 规范（CONTRACT §9）：把 io-specs/<role>.io.yaml 真的送进模型上下文，
  * 而不是只躺在仓库里当文档。
  */
+/**
+ * prompts/<role>.system.md 是该角色的系统骨架。
+ * 与 io-spec 一样在 apply 时读入，交给 fgs-graph 注入；不读的话文件只是仓库里的文档。
+ */
+function loadRolePrompt(role) {
+  try {
+    return readFileSync(new URL(`./prompts/${role}.system.md`, import.meta.url), 'utf8').trim();
+  } catch (err) {
+    try {
+      console.warn(`[fgs] prompts/${role}.system.md 读取失败，已跳过注入: ${err?.message}`);
+    } catch {
+      /* 诊断输出失败不得影响加载 */
+    }
+    return '';
+  }
+}
+
 function loadIoSchema(role) {
   try {
     const raw = readFileSync(new URL(`./io-specs/${role}.io.yaml`, import.meta.url), 'utf8');
@@ -2222,6 +2239,7 @@ export function apply(ctx, config = {}) {
   };
   const ioSpecs = { decide: loadIoSchema('decide'), execute: loadIoSchema('execute') };
   const ioSchemaFor = (role) => ioSpecs[role] ?? null;
+  const rolePrompts = { decide: loadRolePrompt('decide'), execute: loadRolePrompt('execute') };
 
   hold(registerTools(ctx, cfg, runs, registries, detached));
 
@@ -2394,6 +2412,7 @@ export function apply(ctx, config = {}) {
             graphMutationTools: GRAPH_MUTATION_TOOLS,
             executeDeniedGraphTools: EXECUTE_DENIED_GRAPH_TOOLS,
             injectMaxChars: run.cfg?.injectMaxChars ?? 24000,
+            rolePrompt: rolePrompts[run.role] ?? '',
             // v3（缺陷 K/L）：注入面必须知道「我是谁」和「租约多长」，
             // 才能把 mine / unclaimed / 可接手(租约已过期) 标在 open steps 那一行上。
             sid: run.sid,

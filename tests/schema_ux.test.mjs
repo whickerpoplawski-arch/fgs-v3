@@ -257,6 +257,26 @@ test('插件默认 any：satisfiedBy 里只要一条 fact 含 flag 就能 satisf
   assert.match(denied.text, /fact_origin/);
 });
 
+test('注入的 fgs-graph 含 Decide 冷启动与 Execute findingType', async () => {
+  const { host, agent } = boot();
+  await seed(host, agent);
+  const provider = host.contexts.find((item) => item.name === 'fgs-graph').text;
+  const decideText = provider({ scope: agent });
+  assert.match(decideText, /优先开一条尝试直接满足 goal_final/);
+  assert.match(decideText, /fgs_add_subgoal/);
+  assert.match(decideText, /不调用环境工具/);
+  assert.doesNotMatch(decideText, /过程发现用 findingType/);
+
+  await host.callTool('fgs_commit', {
+    operations: [{ op: 'open_step', action: '收束一条事实', from: ['fact_origin'] }],
+  }, agent);
+  const executeText = provider({ scope: agent });
+  assert.match(executeText, /Execute/);
+  assert.match(executeText, /过程发现用 findingType/);
+  assert.match(executeText, /不要把 Finding 当成 goal_final/);
+  assert.doesNotMatch(executeText, /优先开一条尝试直接满足 goal_final/);
+});
+
 test('提示词：冷启动直冲 Goal，SubGoal/Finding 各一句，且不写打法清单', () => {
   const decide = fs.readFileSync(new URL('../prompts/decide.system.md', import.meta.url), 'utf8');
   const execute = fs.readFileSync(new URL('../prompts/execute.system.md', import.meta.url), 'utf8');
