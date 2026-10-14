@@ -30,7 +30,7 @@ function claimFreshInHook(step, now, leaseMs) {
 export function roleContextText({
   role, store, graph, currentStep = null, draftSummary = '', ioSpec = null,
   graphMutationTools = null, executeDeniedGraphTools = null, injectMaxChars = 24000,
-  sid = null, stepLeaseMs = 0, now = Date.now(),
+  sid = null, stepLeaseMs = 0, now = Date.now(), scheduleNote = '',
 }) {
   if (!graph || !store) return '';
   const lines = [`【FGS 当前角色】${roleLabel(role)}`];
@@ -86,6 +86,7 @@ export function roleContextText({
     lines.push('用 fgs_open_step / fgs_drop_step / fgs_satisfy_goal / fgs_reopen 记草稿，最后 fgs_commit 一次性提交。');
     lines.push('环境执行工具（bash/文件/网络/委派类）本轮会被拒；只读控制面与出站/汇报类工具放行。');
   }
+  if (scheduleNote) lines.push(String(scheduleNote));
   if (draftSummary) lines.push(`【未提交草稿】${draftSummary}`);
   if (ioSpec && (ioSpec.notes.length > 0 || ioSpec.forbidden.length > 0)) {
     const parts = [];

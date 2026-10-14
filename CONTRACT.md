@@ -159,6 +159,8 @@ env/windows.*               # WSL/PS 规范化
 | 6 | 多 worker 租约**不做** | **做**：`claim_step` + `owner`/`claimedAt`（`stepLeaseMs` 默认 30min 超时后可被接手） | v1《无径之径》：「**Intent 认领有心跳超时与自动释放**」「Dispatcher 是协议的唯一写入者」；而实测证明「谁先看到谁执行」会造成 **6/6 跨会话因果链错位** |
 | 7 | 未明确 | **§4 收窄为真正重要的那条**：没有 Step 的会话不得使用环境执行工具；goal 级判断（`satisfy_goal`/`reopen`）仍由 Decide 独占 | v2 只规定 Decide「只拥有查看和操作 FGS 图的 Tool」、Execute 拥有改世界状态的 Tool；互相禁止图操作并非 v2 要求，且会造成僵死 |
 
+`executeSessionTtlMs`（默认 10 分钟）是**单题 Execute 会话墙钟**。到期由 Controller 写一条未完成 Fact，并把当前 open step 的 `owner`/`claimedAt` 放回任务池（step 仍为 open，挂上 `linkedUnfinishedFactId`），题目标 `deferred`。`stepLeaseMs`（默认 30 分钟）只决定别人何时能 `claim_step` 接手仍被占用的 step。两者正交：租约过期不写未完成 Fact，会话 TTL 也不替换租约，且不用 goal 级 `reopen`。
+
 ### 12.2 保留不变的
 
 - 图是**唯一外化记忆**；顶层键只有 `facts` / `goals` / `steps`。

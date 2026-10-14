@@ -15,6 +15,8 @@ export const OP = Object.freeze({
   SEED_ORIGIN: 'seed_origin',
   SATISFY_GOAL: 'satisfy_goal',
   REOPEN: 'reopen',
+  // Execute 会话墙钟到期：写未完成 Fact，并把 open step 的认领放回池（不关 step）。
+  RELEASE_STEP: 'release_step',
 });
 
 /** 校验失败拒写，不落盘（CONTRACT §3）。 */
@@ -46,6 +48,15 @@ export function openStepOp({
  */
 export function claimStepOp({ stepId, owner, claimedAt = null }) {
   return { type: OP.CLAIM_STEP, stepId, owner, claimedAt };
+}
+
+/**
+ * release_step：Execute 会话超时用。追加一条未完成 Fact，清掉该 owner 名下
+ * open step 的 owner/claimedAt（step 仍 open），并把 Fact 记在目标 step 上。
+ * 不是 goal 级 reopen。
+ */
+export function releaseStepOp({ stepId, factTitle, factContent }) {
+  return { type: OP.RELEASE_STEP, stepId, factTitle, factContent };
 }
 
 /** drop_step：必须 reason。 */

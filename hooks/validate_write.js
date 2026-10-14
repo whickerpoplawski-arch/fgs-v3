@@ -65,6 +65,11 @@ export function preflight(op) {
         throw new WriteRejected('claim_step 缺 stepId（拒写）');
       }
       return;
+    case OP.RELEASE_STEP:
+      if (!hasText(op.stepId) || !hasText(op.factTitle) || !hasText(op.factContent)) {
+        throw new WriteRejected('release_step 缺 stepId/factTitle/factContent（禁止空超时）');
+      }
+      return;
     default:
       throw new WriteRejected(`未知操作类型: ${op?.type}`);
   }

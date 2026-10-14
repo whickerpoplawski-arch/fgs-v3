@@ -313,9 +313,9 @@ test('A4：tests/contract_fixes.test.mjs 与 v3 逐字节相同，§4 仍是 web
 
 /* ==================================================================== A5 */
 
-test('A5：gen=10；BUILD_TAG 去掉 +deny-net-delegate 且保留 v3 全部 token', () => {
-  assert.equal(PLUGIN_GENERATION, 10, 'PLUGIN_GENERATION 必须仍为 10');
-  assert.match(BUILD_TAG, /^10\+/, 'BUILD_TAG 前缀必须是 10+');
+test('A5：gen=11；BUILD_TAG 去掉 +deny-net-delegate 且保留 v3 全部 token', () => {
+  assert.equal(PLUGIN_GENERATION, 11, 'PLUGIN_GENERATION 必须为 11');
+  assert.match(BUILD_TAG, /^11\+/, 'BUILD_TAG 前缀必须是 11+');
   assert.ok(!BUILD_TAG.includes('deny-net-delegate'), `BUILD_TAG 仍含已回退标记: ${BUILD_TAG}`);
   const tokens = BUILD_TAG.split('+');
   assert.deepEqual(tokens.filter((t, i) => tokens.indexOf(t) !== i), [], 'BUILD_TAG token 重复');

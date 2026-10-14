@@ -36,6 +36,7 @@ export function graphToDoc(graph) {
     if (f.createdAt !== undefined) d.createdAt = f.createdAt;
     if (f.producedBy !== undefined && f.producedBy !== null) d.producedBy = f.producedBy;
     if (f.findingType !== undefined && f.findingType !== null) d.findingType = f.findingType;
+    if (f.kind !== undefined && f.kind !== null) d.kind = f.kind;
     return d;
   });
   const goals = graph.goals.map((g) => {
@@ -69,6 +70,7 @@ export function graphToDoc(graph) {
     // Cairn「Intent 认领」：owner/claimedAt 是图的一部分（可随时停止/恢复、跨会话可见）。
     if (s.owner !== undefined && s.owner !== null) d.owner = s.owner;
     if (s.claimedAt !== undefined && s.claimedAt !== null) d.claimedAt = s.claimedAt;
+    if (s.linkedUnfinishedFactId) d.linkedUnfinishedFactId = s.linkedUnfinishedFactId;
     return d;
   });
   return { facts, goals, steps };
@@ -84,6 +86,7 @@ export function graphFromDoc(doc) {
       createdAt: f.createdAt === undefined || f.createdAt === null ? null : String(f.createdAt),
       producedBy: f.producedBy ?? null,
       findingType: f.findingType ?? null,
+      kind: f.kind ?? null,
     })),
     goals: (src.goals ?? []).map((g) => ({
       id: g.id,
@@ -109,6 +112,7 @@ export function graphFromDoc(doc) {
       reason: s.reason ?? null,
       owner: s.owner ?? null,
       claimedAt: s.claimedAt === undefined || s.claimedAt === null ? null : String(s.claimedAt),
+      linkedUnfinishedFactId: s.linkedUnfinishedFactId ?? null,
     })),
   };
 }
@@ -256,13 +260,16 @@ export class GraphStore {
       const isOpen = s.state === 'open';
       if (isOpen) openSeen += 1;
       if (isOpen && openSeen > maxDetailedOpen) {
-        return { id: s.id, state: 'open', priority: s.priority };
+        const tiny = { id: s.id, state: 'open', priority: s.priority };
+        if (s.linkedUnfinishedFactId) tiny.linkedUnfinishedFactId = s.linkedUnfinishedFactId;
+        return tiny;
       }
       const short = { id: s.id };
       if (s.state !== undefined) short.state = s.state;
       if (s.priority !== undefined) short.priority = s.priority;
       if (s.from) short.from = s.from;
       if (s.owner) short.owner = s.owner;
+      if (s.linkedUnfinishedFactId) short.linkedUnfinishedFactId = s.linkedUnfinishedFactId;
       if (s.to) short.to = s.to;
       if (s.droppedReason) short.droppedReason = s.droppedReason;
       if (s.action) {
@@ -398,6 +405,9 @@ export class GraphStore {
         }
       }
       if (s.state === 'dropped' && !s.reason) errs.push(`step ${s.id} state=dropped 但无 reason`);
+      if (s.linkedUnfinishedFactId && !factIds.has(s.linkedUnfinishedFactId)) {
+        errs.push(`step ${s.id}.linkedUnfinishedFactId 引用不存在 fact: ${s.linkedUnfinishedFactId}`);
+      }
     }
     for (const g of graph.goals) {
       for (const fid of g.satisfiedBy ?? []) {
@@ -493,6 +503,8 @@ export class Controller {
         return this.satisfyGoal(graph, op);
       case OP.REOPEN:
         return this.reopen(graph, op);
+      case OP.RELEASE_STEP:
+        return this.releaseStep(graph, op);
       default:
         throw new WriteRejected(`未知操作类型: ${op?.type}`);
     }
@@ -556,6 +568,49 @@ export class Controller {
     step.owner = op.owner;
     step.claimedAt = op.claimedAt ?? nowIsoZ();
     return `claim_step ${op.stepId} -> ${op.owner}`;
+  }
+
+  /**
+   * Execute 会话超时：追加一条未完成 Fact（不把 step 收成 done），
+   * 释放该 owner 名下全部 open step 的认领。目标 step 记下 linkedUnfinishedFactId。
+   * 已释放且已挂上 Fact 时幂等，不再追加。
+   */
+  releaseStep(graph, op) {
+    if (!hasText(op.stepId) || !hasText(op.factTitle) || !hasText(op.factContent)) {
+      throw new WriteRejected('release_step 缺 stepId/factTitle/factContent（禁止空超时）');
+    }
+    const step = findStep(graph, op.stepId);
+    if (step.state !== 'open') {
+      throw new WriteRejected(`release_step 目标不是 open step: ${op.stepId}（state=${step.state}）`);
+    }
+    if (!step.owner && step.linkedUnfinishedFactId) {
+      return `release_step ${op.stepId} already`;
+    }
+    this.checkFactDistill(op.factTitle, op.factContent);
+    const fid = this.store.nextFactId(graph);
+    graph.facts.push({
+      id: fid,
+      title: op.factTitle,
+      content: op.factContent,
+      createdAt: nowIsoZ(),
+      producedBy: step.id,
+      findingType: null,
+      kind: 'unfinished',
+    });
+    const owner = step.owner;
+    step.linkedUnfinishedFactId = fid;
+    if (owner) {
+      for (const other of graph.steps) {
+        if (other.state === 'open' && other.owner === owner) {
+          other.owner = null;
+          other.claimedAt = null;
+        }
+      }
+    } else {
+      step.owner = null;
+      step.claimedAt = null;
+    }
+    return `release_step ${op.stepId} -> ${fid}`;
   }
 
   dropStep(graph, op) {
